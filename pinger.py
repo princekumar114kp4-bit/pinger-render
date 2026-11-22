@@ -1,5 +1,7 @@
 """Keep-alive pinger with a Telegram control panel (premium look).
 
+The panel uses reply keyboard buttons (above the chat box), not buttons under the message.
+
 Env: BOT_TOKEN, OWNER_ID (your numeric Telegram id), PING_URLS and PING_MINUTES (seeds,
 used on first start only), DATA_DIR (default /tmp/pinger-data), PORT (default 10000),
 RENDER_EXTERNAL_URL (set by Render, pinged automatically), TELEGRAM_API_BASE (optional).
@@ -112,27 +114,36 @@ def _emit(out, template, raw):
 
 
 def rich(template, *raw):
-    """Message text plus entities, for sendMessage or editMessageText (no parse_mode)."""
+    """Message text plus entities, for sendMessage (no parse_mode)."""
     out = _Out()
     _emit(out, template, raw)
     return {"text": out.text, "entities": out.entities}
 
 
-def plain(template, *raw):
-    """Popup text (answerCallbackQuery takes no entities): normal emoji only."""
-    return rich(template, *raw)["text"]
+def join_rich(first, second):
+    """Two rich messages one after the other, with a blank line between them."""
+    gap = "\n\n"
+    shift = u16(first["text"] + gap)
+    return {"text": first["text"] + gap + second["text"],
+            "entities": first["entities"]
+            + [dict(e, offset=e["offset"] + shift) for e in second["entities"]]}
 
 
-def btn(name, text, data, style):
-    """Inline button with a colour style. The premium icon is used when its ID is set,
-    otherwise the normal emoji goes into the label."""
-    button = {"text": text, "callback_data": data, "style": style}
+def rbtn(name, text, style):
+    """Reply keyboard button with a colour style. The premium icon goes in icon_custom_emoji_id
+    when its ID is set, otherwise the normal emoji becomes part of the label text."""
+    button = {"text": text, "style": style}
     if name:
         if PREMIUM_EMOJI.get(name):
             button["icon_custom_emoji_id"] = PREMIUM_EMOJI[name]
         else:
             button["text"] = f"{FALLBACK_EMOJI[name]} {text}"
     return button
+
+
+def reply_kb(rows):
+    """Reply keyboard: sits above the chat box and stays until a new keyboard is sent."""
+    return {"keyboard": rows, "resize_keyboard": True}
 
 
 def utf16_slice(text, offset, length):
@@ -150,6 +161,45 @@ def message_text(msg):
 def parse_cmd(text):
     word, _, arg = text.partition(" ")
     return word.split("@")[0].lower(), arg.strip()
+
+
+# ---- Button labels: what a tap sends back as text ----------------------------------
+# Each fixed button: (icon name, label, action). Telegram sends the label text back as a
+# normal message when the button is tapped, so the handler matches that text exactly.
+FIXED_BUTTONS = [
+    ("ping", "Ping now", "ping"),
+    ("pause", "Pause", "toggle"),
+    ("play", "Resume", "toggle"),
+    ("minus", "-1", "int:-1"),
+    ("plus", "+1", "int:1"),
+    ("list", "List URLs", "list"),
+    ("add", "Add URL", "add"),
+    ("remove", "Remove", "rm"),
+    ("refresh", "Refresh", "refresh"),
+    ("close", "Close", "close"),
+    ("cancel", "Cancel", "cancel"),
+    ("back", "Back", "home"),
+]
+# Both spellings are accepted (with the normal emoji and without it), because a button can
+# lose its emoji when Telegram refuses a premium icon.
+LABEL_ACTION = {}
+for _name, _text, _action in FIXED_BUTTONS:
+    LABEL_ACTION[_text] = _action
+    LABEL_ACTION[f"{FALLBACK_EMOJI[_name]} {_text}"] = _action
+# The interval button shows the current minutes, e.g. "5 min".
+INTERVAL_LABEL = re.compile(r"^(?:%s )?\d+ min$" % re.escape(FALLBACK_EMOJI["clock"]))
+
+
+def remove_label(i, url):
+    return f"{i}. {short(url, 40)}"
+
+
+def url_for_label(text, urls):
+    """The URL whose remove button has this exact label, or None."""
+    for i, url in enumerate(urls, 1):
+        if remove_label(i, url) == text:
+            return url
+    return None
 
 
 # ---- Pinger and state ---------------------------------------------------------------
@@ -343,18 +393,18 @@ def has_premium(msg, markup):
     if any(e["type"] == "custom_emoji" for e in msg["entities"]):
         return True
     return bool(markup) and any("icon_custom_emoji_id" in b
-                                for row in markup["inline_keyboard"] for b in row)
+                                for row in markup.get("keyboard", []) for b in row)
 
 
 def without_premium(msg, markup):
     """The same message with premium icons removed, used when Telegram refuses them."""
     plain_msg = {"text": msg["text"],
                  "entities": [e for e in msg["entities"] if e["type"] != "custom_emoji"]}
-    if not markup:
+    if not markup or "keyboard" not in markup:
         return plain_msg, markup
     rows = [[{k: v for k, v in b.items() if k != "icon_custom_emoji_id"} for b in row]
-            for row in markup["inline_keyboard"]]
-    return plain_msg, {"inline_keyboard": rows}
+            for row in markup["keyboard"]]
+    return plain_msg, reply_kb(rows)
 
 
 class Telegram:
@@ -372,30 +422,24 @@ class Telegram:
             raise RetryAfter(int((data.get("parameters") or {}).get("retry_after", 5)))
         raise ApiError(data.get("description", "unknown error"))
 
-    def deliver(self, method, msg, markup=None, **where):
+    def send(self, chat_id, msg, markup=None):
+        """Sends one message. Returns Telegram's result (it holds the new message_id)."""
         try:
-            self.call(method, **where, **body(msg, markup))
+            return self.call("sendMessage", chat_id=chat_id, **body(msg, markup))
         except ApiError as e:
-            if "message is not modified" in str(e):
-                return
             if str(e).endswith(" failed") or not has_premium(msg, markup):
                 raise
             # Telegram refused a premium ID: send the same message with normal emoji instead.
             log("premium look refused, sent plain look")
             plain_msg, plain_markup = without_premium(msg, markup)
-            self.call(method, **where, **body(plain_msg, plain_markup))
+            return self.call("sendMessage", chat_id=chat_id, **body(plain_msg, plain_markup))
 
-    def send(self, chat_id, msg, markup=None):
-        self.deliver("sendMessage", msg, markup, chat_id=chat_id)
-
-    def edit(self, chat_id, message_id, msg, markup):
-        self.deliver("editMessageText", msg, markup, chat_id=chat_id, message_id=message_id)
-
-    def answer(self, callback_id, text=""):
+    def delete(self, chat_id, message_id):
+        """Tidy-up only: if the delete fails, the old panel just stays in the chat."""
         try:
-            self.call("answerCallbackQuery", callback_query_id=callback_id, text=text[:200])
-        except ApiError as e:
-            log(f"answer failed: {e}")
+            self.call("deleteMessage", chat_id=chat_id, message_id=message_id)
+        except Exception:
+            pass
 
 
 # ---- Panel texts and keyboards -------------------------------------------------------
@@ -435,28 +479,29 @@ def list_text(snap):
 
 def main_kb(snap):
     if snap["paused"]:
-        toggle = btn("play", "Resume", "toggle", GO)
+        toggle = rbtn("play", "Resume", GO)
     else:
-        toggle = btn("pause", "Pause", "toggle", STOP)
-    return {"inline_keyboard": [
-        [btn("ping", "Ping now", "ping", INFO), toggle],
-        [btn("minus", "-1", "int:-1", INFO), btn("clock", f"{snap['minutes']} min", "noop", INFO),
-         btn("plus", "+1", "int:1", INFO)],
-        [btn("list", "List URLs", "list", INFO), btn("add", "Add URL", "add", GO)],
-        [btn("remove", "Remove", "rm", STOP), btn("refresh", "Refresh", "refresh", INFO)],
-        [btn("close", "Close", "close", STOP)],
-    ]}
+        toggle = rbtn("pause", "Pause", STOP)
+    return reply_kb([
+        [rbtn("ping", "Ping now", INFO), toggle],
+        [rbtn("minus", "-1", INFO), rbtn("clock", f"{snap['minutes']} min", INFO),
+         rbtn("plus", "+1", INFO)],
+        [rbtn("list", "List URLs", INFO), rbtn("add", "Add URL", GO)],
+        [rbtn("remove", "Remove", STOP), rbtn("refresh", "Refresh", INFO)],
+        [rbtn("close", "Close", STOP)],
+    ])
 
 
-def sub_kb(snap=None, cancel=False):
-    """Back button, Cancel button, or one Remove button per URL (when snap is given)."""
-    if cancel:
-        return {"inline_keyboard": [[btn("cancel", "Cancel", "cancel", STOP)]]}
+def sub_kb(snap=None):
+    """Back button, plus one Remove button per URL when snap is given."""
     rows = []
     if snap:
-        rows = [[btn("remove", f"{i}. {short(u, 40)}", f"rmi:{i}", STOP)]
-                for i, u in enumerate(snap["urls"], 1)]
-    return {"inline_keyboard": rows + [[btn("back", "Back", "home", INFO)]]}
+        rows = [[rbtn(None, remove_label(i, u), STOP)] for i, u in enumerate(snap["urls"], 1)]
+    return reply_kb(rows + [[rbtn("back", "Back", INFO)]])
+
+
+def cancel_kb():
+    return reply_kb([[rbtn("cancel", "Cancel", STOP)]])
 
 
 class Panel:
@@ -467,16 +512,15 @@ class Panel:
         self.owner = int(raw) if raw.isdigit() else None
         if raw and self.owner is None:
             log("OWNER_ID must be numeric, ignoring it")
-        self.pending = {}  # chat_id -> (expires_at, panel message id or None)
+        self.pending = {}    # chat_id -> time when the bot stops waiting for a URL
+        self.panel_mid = {}  # chat_id -> message id of the last panel, removed after the next one
 
     def handle(self, update):
-        if "callback_query" in update:
-            self.on_callback(update["callback_query"])
-        elif "message" in update:
+        if "message" in update:
             self.on_message(update["message"])
 
     def on_message(self, msg):
-        raw_text, ents = message_text(msg)  # entities refer to raw_text, so slice that one
+        raw_text, _ = message_text(msg)
         text = raw_text.strip()
         chat_id = msg["chat"]["id"]
         user_id = (msg.get("from") or {}).get("id")
@@ -494,61 +538,69 @@ class Panel:
         if not text:
             return
         cmd, arg = parse_cmd(text)
-        if not cmd.startswith("/") and chat_id in self.pending:
-            return self.take_url(chat_id, text)
-        handler = getattr(self, "cmd_" + cmd[1:], None) if cmd.startswith("/") else None
-        if handler:
-            handler(chat_id, arg)
-
-    def on_callback(self, cq):
-        if self.owner is None:
+        if cmd.startswith("/"):
+            handler = getattr(self, "cmd_" + cmd[1:], None)
+            if handler:
+                handler(chat_id, arg)
             return
-        if (cq.get("from") or {}).get("id") != self.owner:
-            return self.tg.answer(cq["id"], plain("{e:lock} Ye bot private hai."))
-        msg = cq.get("message")
-        if not msg:
-            return self.tg.answer(cq["id"], plain("{e:info} Ye panel purana hai. /start likho."))
-        chat_id, mid = msg["chat"]["id"], msg["message_id"]
-        toast, view = self.act(cq.get("data", ""), chat_id, mid)
-        self.tg.answer(cq["id"], toast)
-        self.show(chat_id, mid, view)
+        if self.on_label(chat_id, text):
+            return
+        if chat_id in self.pending:
+            self.take_url(chat_id, text)
 
-    def act(self, data, chat_id, mid):
-        """Runs one panel button. Returns (popup text, view to show)."""
+    def on_label(self, chat_id, text):
+        """Runs the action of a reply button the owner tapped. False when the text is no button."""
+        action = LABEL_ACTION.get(text)
+        if action is None and INTERVAL_LABEL.match(text):
+            action = "noop"  # the interval button only shows the value
+        if action is None:
+            url = url_for_label(text, self.store.snapshot()["urls"])
+            if url is None:
+                return False
+            action = "rmu:" + url
+        self.act(action, chat_id)
+        return True
+
+    def act(self, data, chat_id):
+        """Runs one panel button, then sends the updated panel."""
         name, _, arg = data.partition(":")
         store = self.store
+        note, view = None, "main"
         if name == "ping":
             store.force.set()
-            return plain("{e:ping} Ping shuru ho gayi"), "main"
-        if name == "toggle":
+            note = rich("{e:ping} Ping shuru ho gayi")
+        elif name == "toggle":
             if store.toggle():
-                return plain("{e:pause} Paused"), "main"
-            return plain("{e:play} Running"), "main"
-        if name == "int":
-            return plain("{e:clock} Interval {0} min", store.bump(int(arg))), "main"
-        if name == "list":
-            return "", "list"
-        if name == "rm":
-            return "", "remove"
-        if name == "rmi":
+                note = rich("{e:pause} Paused")
+            else:
+                note = rich("{e:play} Running")
+        elif name == "int":
+            note = rich("{e:clock} Interval {0} min", store.bump(int(arg)))
+        elif name == "list":
+            view = "list"
+        elif name == "rm":
+            view = "remove"
+        elif name == "rmu":
             gone = store.remove(arg)
             if gone:
-                return plain("{e:remove} Hata diya"), "remove"
-            return plain("{e:warn} Ye ab list me nahi hai"), "remove"
-        if name == "add":
-            self.pending[chat_id] = (time.time() + ADD_WINDOW, mid)
-            return plain("{e:add} URL bhejo"), "add"
-        if name == "cancel":
+                note = rich("{e:remove} Hata diya")
+            else:
+                note = rich("{e:warn} Ye ab list me nahi hai")
+            view = "remove"
+        elif name == "add":
+            self.pending[chat_id] = time.time() + ADD_WINDOW
+            view = "add"
+        elif name == "cancel":
             self.pending.pop(chat_id, None)
-            return plain("{e:cancel} Cancel ho gaya"), "main"
-        if name == "close":
-            return plain("{e:close} Panel band"), "closed"
-        if name == "refresh":
-            return plain("{e:refresh} Updated"), "main"
-        return "", "main"
+            note = rich("{e:cancel} Cancel ho gaya")
+        elif name == "close":
+            view = "closed"
+        elif name == "refresh":
+            note = rich("{e:refresh} Updated")
+        self.show(chat_id, view, note)
 
-    def show(self, chat_id, mid, view):
-        """Edits the panel message in place into the given view."""
+    def show(self, chat_id, view, note=None):
+        """Sends the panel for a view as one new message with its keyboard, then removes the old one."""
         snap = self.store.snapshot()
         if view == "list":
             msg, markup = list_text(snap), sub_kb()
@@ -561,12 +613,19 @@ class Panel:
         elif view == "add":
             msg = rich("{e:globe} Ab mujhe URL bhejo (http:// ya https:// se shuru). "
                        "2 minute tak wait karunga.")
-            markup = sub_kb(cancel=True)
+            markup = cancel_kb()
         elif view == "closed":
-            msg, markup = rich("{e:close} Panel band hai. /start likho to phir khul jayega."), {"inline_keyboard": []}
+            msg = rich("{e:close} Panel band hai. /start likho to phir khul jayega.")
+            markup = {"remove_keyboard": True}
         else:
             msg, markup = card_text(snap), main_kb(snap)
-        self.tg.edit(chat_id, mid, msg, markup)
+        if note is not None:
+            msg = join_rich(note, msg)
+        sent = self.tg.send(chat_id, msg, markup)
+        old = self.panel_mid.get(chat_id)
+        self.panel_mid[chat_id] = (sent or {}).get("message_id")
+        if old:
+            self.tg.delete(chat_id, old)
 
     def add_url(self, text):
         url = text.strip()
@@ -580,16 +639,14 @@ class Panel:
         return rich("{e:ok} Add ho gaya: {0}", url)
 
     def take_url(self, chat_id, text):
-        expires, mid = self.pending.pop(chat_id)
+        expires = self.pending.pop(chat_id)
         if time.time() > expires:
-            return
-        self.tg.send(chat_id, self.add_url(text))
-        if mid:
-            self.show(chat_id, mid, "main")
+            return self.show(chat_id, "main",
+                             rich("{e:info} Wait time nikal gaya. Phir se Add URL dabao."))
+        self.show(chat_id, "main", self.add_url(text))
 
     def cmd_start(self, chat_id, arg):
-        snap = self.store.snapshot()
-        self.tg.send(chat_id, card_text(snap), main_kb(snap))
+        self.show(chat_id, "main")
 
     def cmd_status(self, chat_id, arg):
         self.tg.send(chat_id, card_text(self.store.snapshot()))
@@ -599,8 +656,8 @@ class Panel:
 
     def cmd_add(self, chat_id, arg):
         if arg:
-            return self.tg.send(chat_id, self.add_url(arg))
-        self.pending[chat_id] = (time.time() + ADD_WINDOW, None)
+            return self.show(chat_id, "main", self.add_url(arg))
+        self.pending[chat_id] = time.time() + ADD_WINDOW
         self.tg.send(chat_id, rich("{e:globe} Ab URL bhejo (http:// ya https://). /cancel se rok sakte ho."))
 
     def cmd_remove(self, chat_id, arg):
@@ -608,32 +665,32 @@ class Panel:
             return self.tg.send(chat_id, rich("{e:info} Aise likho: /remove 2 ya /remove https://..."))
         gone = self.store.remove(arg)
         if gone:
-            return self.tg.send(chat_id, rich("{e:remove} Hata diya: {0}", gone))
-        self.tg.send(chat_id, rich("{e:fail} Ye number ya URL list me nahi mila."))
+            return self.show(chat_id, "main", rich("{e:remove} Hata diya: {0}", gone))
+        self.show(chat_id, "main", rich("{e:fail} Ye number ya URL list me nahi mila."))
 
     def cmd_interval(self, chat_id, arg):
         if not (arg.isdigit() and 1 <= int(arg) <= 60):
             return self.tg.send(chat_id, rich("{e:warn} Interval 1 se 60 minute ke beech do. Jaise: /interval 5"))
         self.store.set_minutes(int(arg))
-        self.tg.send(chat_id, rich("{e:clock} Interval ab {0} minute hai.", int(arg)))
+        self.show(chat_id, "main", rich("{e:clock} Interval ab {0} minute hai.", int(arg)))
 
     def cmd_pingnow(self, chat_id, arg):
         self.store.force.set()
-        self.tg.send(chat_id, rich("{e:ping} Ping shuru ho gayi. Result ke liye /status likho."))
+        self.show(chat_id, "main", rich("{e:ping} Ping shuru ho gayi. Result ke liye /status likho."))
 
     def cmd_pause(self, chat_id, arg):
         if self.store.set_paused(True):
-            return self.tg.send(chat_id, rich("{e:pause} Pause ho gaya."))
-        self.tg.send(chat_id, rich("{e:info} Ye pehle se pause hai."))
+            return self.show(chat_id, "main", rich("{e:pause} Pause ho gaya."))
+        self.show(chat_id, "main", rich("{e:info} Ye pehle se pause hai."))
 
     def cmd_resume(self, chat_id, arg):
         if self.store.set_paused(False):
-            return self.tg.send(chat_id, rich("{e:play} Resume ho gaya."))
-        self.tg.send(chat_id, rich("{e:info} Ye pehle se chal raha hai."))
+            return self.show(chat_id, "main", rich("{e:play} Resume ho gaya."))
+        self.show(chat_id, "main", rich("{e:info} Ye pehle se chal raha hai."))
 
     def cmd_cancel(self, chat_id, arg):
         self.pending.pop(chat_id, None)
-        self.tg.send(chat_id, rich("{e:cancel} Cancel ho gaya."))
+        self.show(chat_id, "main", rich("{e:cancel} Cancel ho gaya."))
 
 
 def poll_loop(panel):
@@ -645,7 +702,7 @@ def poll_loop(panel):
     while True:
         try:
             updates = panel.tg.call("getUpdates", offset=offset, timeout=25,
-                                    allowed_updates=["message", "callback_query"])
+                                    allowed_updates=["message"])
         except RetryAfter as e:
             time.sleep(e.seconds)
             continue
