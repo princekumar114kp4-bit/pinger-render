@@ -1,5 +1,8 @@
 Keep-Alive Panel (Telegram se control)
 
+Panel ke buttons chat box ke upar dikhte hain (keyboard), message ke neeche nahi.
+Button dabane par uska naam apne aap chat me message ban kar bot ko chala jata hai.
+
 Ek bot banao:
 1. Telegram me @BotFather kholo, /newbot likho, naam aur username do.
 2. Wo token copy karo jo milega. Ye secret hai, kisi ko mat dikhana.
@@ -19,6 +22,9 @@ Pehli baar:
 - Apne bot me /start likho.
 - Agar OWNER_ID nahi daala tha, to bot tumhara ID bhejega. Wo ID OWNER_ID me daalo, service restart karo, phir /start likho.
 - Panel khul jayega. Buttons se URL add/remove, interval badlo, Pause/Resume karo, ya Ping now dabao.
+- Add URL dabao to bot URL maangega (2 minute tak). Cancel dabao to ruk jayega.
+- Har action ke baad panel ek naya message bankar aata hai, purana panel hata diya jata hai.
+- Close dabane par buttons hat jaate hain. Phir se panel ke liye /start likho.
 
 Commands: /add https://...  /remove 2  /list  /interval 5  /pingnow  /pause  /resume  /status
 
