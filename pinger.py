@@ -15,7 +15,7 @@ import os
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from urllib.parse import urlparse
 
 import requests
@@ -23,6 +23,7 @@ from flask import Flask, Response
 
 MAX_URLS = 20
 ADD_WINDOW = 120  # seconds the bot waits for a URL after "Add URL"
+ROUND_CAP = 45  # seconds: a ping round never waits longer than this for one URL
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 API_BASE = os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/")
 
@@ -50,6 +51,8 @@ GO, STOP, INFO = "success", "danger", "primary"
 
 app = Flask(__name__)
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
+# Library warnings can print the full request address, which holds the bot token.
+logging.getLogger("urllib3").setLevel(logging.CRITICAL)
 
 
 def log(msg):
@@ -159,8 +162,12 @@ def message_text(msg):
 
 
 def parse_cmd(text):
-    word, _, arg = text.partition(" ")
-    return word.split("@")[0].lower(), arg.strip()
+    parts = text.split(maxsplit=1)  # any whitespace ends the command word, e.g. a newline
+    if not parts:
+        return "", ""
+    word = parts[0]
+    arg = parts[1].strip() if len(parts) > 1 else ""
+    return word.split("@")[0].lower(), arg
 
 
 # ---- Button labels: what a tap sends back as text ----------------------------------
@@ -188,6 +195,8 @@ for _name, _text, _action in FIXED_BUTTONS:
     LABEL_ACTION[f"{FALLBACK_EMOJI[_name]} {_text}"] = _action
 # The interval button shows the current minutes, e.g. "5 min".
 INTERVAL_LABEL = re.compile(r"^(?:%s )?\d+ min$" % re.escape(FALLBACK_EMOJI["clock"]))
+# Remove buttons read "1. https://...": the number is the position in the list.
+REMOVE_LABEL = re.compile(r"^\d+\. ")
 
 
 def remove_label(i, url):
@@ -205,9 +214,16 @@ def url_for_label(text, urls):
 # ---- Pinger and state ---------------------------------------------------------------
 
 def valid_url(value):
-    if len(value) > 500 or any(c.isspace() for c in value):
+    if not isinstance(value, str) or not value or len(value) > 500:
         return False
-    return value.startswith(("http://", "https://")) and bool(urlparse(value).netloc)
+    if any(c.isspace() or ord(c) < 32 for c in value):
+        return False
+    if not value.lower().startswith(("http://", "https://")):
+        return False
+    try:
+        return bool(urlparse(value).netloc)
+    except ValueError:  # malformed address such as an unclosed "[" in the host
+        return False
 
 
 def short(text, limit=60):
@@ -225,15 +241,16 @@ def fmt_uptime(seconds):
 
 
 def seed_minutes():
-    try:
-        value = int(os.environ.get("PING_MINUTES", "10").strip())
-    except ValueError:
-        return 10
-    return min(value, 60) if value > 0 else 10
+    """PING_MINUTES from the environment. Anything that is not 1 to 60 means the default, 10."""
+    raw = os.environ.get("PING_MINUTES", "").strip()
+    if raw.isdecimal() and 1 <= int(raw) <= 60:
+        return int(raw)
+    return 10
 
 
 def seed_urls():
-    parts = dict.fromkeys(p.strip() for p in os.environ.get("PING_URLS", "").split(","))
+    """PING_URLS split on commas or spaces. Empty items and bad URLs are skipped."""
+    parts = dict.fromkeys(p for p in re.split(r"[\s,]+", os.environ.get("PING_URLS", "")) if p)
     return [u for u in parts if valid_url(u)][:MAX_URLS]
 
 
@@ -243,11 +260,18 @@ def own_url():
 
 
 def ping_one(url):
-    host = urlparse(url).hostname or "unknown-host"
     try:
-        code = str(requests.get(url, timeout=20).status_code)
+        host = urlparse(url).hostname or "unknown-host"
+    except ValueError:
+        host = "unknown-host"
+    code = "down"
+    try:
+        # stream=True: only the status line is needed, the body is not downloaded
+        resp = requests.get(url, timeout=20, stream=True)
+        code = str(resp.status_code)
+        resp.close()
     except Exception:
-        code = "down"
+        code = "down"  # error text is not logged: it can contain the full URL
     log(f"ping {code} {host}")  # host only, never the full URL
     return code
 
@@ -264,27 +288,53 @@ class Store:
         self.d = self.load()
 
     def load(self):
+        data = None
         try:
             with open(self.path, encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                return data
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                data = loaded
         except FileNotFoundError:
             pass
         except (OSError, ValueError):
             log("state file unreadable, starting over")
-        data = {"urls": seed_urls(), "minutes": seed_minutes(), "paused": False,
-                "last_at": None, "summary": "", "results": {}}
-        self.write(data)
-        return data
+        if data is None:  # first start, or the file is unreadable: start from the seeds
+            data = self.clean({})
+            self.write(data)
+            return data
+        return self.clean(data)
+
+    def clean(self, data):
+        """Fills in missing keys and drops values of the wrong type (an old or hand-edited file)."""
+        urls = data.get("urls")
+        if isinstance(urls, list):
+            urls = list(dict.fromkeys(u for u in urls if valid_url(u)))[:MAX_URLS]
+        else:
+            urls = seed_urls()
+        minutes = data.get("minutes")
+        if not (isinstance(minutes, int) and not isinstance(minutes, bool) and 1 <= minutes <= 60):
+            minutes = seed_minutes()
+        last_at = data.get("last_at")
+        if not isinstance(last_at, (int, float)) or isinstance(last_at, bool):
+            last_at = None
+        results = data.get("results") if isinstance(data.get("results"), dict) else {}
+        summary = data.get("summary") if isinstance(data.get("summary"), str) else ""
+        return {"urls": urls, "minutes": minutes, "paused": data.get("paused") is True,
+                "last_at": last_at, "summary": summary, "results": results}
 
     def write(self, data):
-        """Atomic write: temp file first, then replace."""
-        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        """Atomic write: temp file first, flushed to disk, then renamed over the real file.
+        A crash in the middle leaves the old file intact. A failed save is logged, not raised."""
         tmp = self.path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=1)
-        os.replace(tmp, self.path)
+        try:
+            os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=1)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.path)
+        except (OSError, TypeError, ValueError):
+            log("state not saved this time")
 
     def snapshot(self):
         with self.lock:
@@ -307,7 +357,7 @@ class Store:
         """key is a 1-based number or an exact URL. Returns the removed URL or None."""
         with self.lock:
             urls = self.d["urls"]
-            if key.isdigit() and 1 <= int(key) <= len(urls):
+            if key.isdecimal() and 1 <= int(key) <= len(urls):
                 url = urls.pop(int(key) - 1)
             elif key in urls:
                 url = urls.pop(urls.index(key))
@@ -355,8 +405,15 @@ class Store:
         own = own_url()
         if own and own not in urls:
             urls.append(own)
-        with ThreadPoolExecutor(max_workers=5) as pool:
-            codes = list(pool.map(ping_one, urls))
+        codes = ["down"] * len(urls)
+        if urls:
+            # All URLs run at once. A URL that hangs past the cap is counted as down,
+            # so one slow site cannot hold up the whole round.
+            pool = ThreadPoolExecutor(max_workers=len(urls))
+            futures = [pool.submit(ping_one, u) for u in urls]
+            done, _ = wait(futures, timeout=ROUND_CAP)
+            codes = [f.result() if f in done else "down" for f in futures]
+            pool.shutdown(wait=False, cancel_futures=True)
         oks = sum(1 for c in codes if is_ok(c))
         with self.lock:
             self.d["results"] = dict(zip(urls, codes))
@@ -375,6 +432,8 @@ def ping_loop(store):
                 store.run_round()
         except Exception as e:
             log(f"ping round error: {type(e).__name__}")
+            with store.lock:  # wait a full interval before trying again, no tight retry loop
+                store.next_due = time.time() + store.d["minutes"] * 60
         store.force.wait(1)
 
 
@@ -416,11 +475,17 @@ class Telegram:
             data = requests.post(self.base + method, json=params, timeout=40).json()
         except Exception:
             raise ApiError(f"{method} failed") from None  # hides the URL, which holds the token
+        if not isinstance(data, dict):
+            raise ApiError(f"{method} failed")
         if data.get("ok"):
             return data.get("result")
         if data.get("error_code") == 429:
-            raise RetryAfter(int((data.get("parameters") or {}).get("retry_after", 5)))
-        raise ApiError(data.get("description", "unknown error"))
+            try:
+                wait_for = int((data.get("parameters") or {}).get("retry_after", 5))
+            except (TypeError, ValueError):
+                wait_for = 5
+            raise RetryAfter(min(max(wait_for, 1), 120))
+        raise ApiError(str(data.get("description", "unknown error"))[:200])
 
     def send(self, chat_id, msg, markup=None):
         """Sends one message. Returns Telegram's result (it holds the new message_id)."""
@@ -509,7 +574,7 @@ class Panel:
         self.tg = tg
         self.store = store
         raw = os.environ.get("OWNER_ID", "").strip()
-        self.owner = int(raw) if raw.isdigit() else None
+        self.owner = int(raw) if raw.isdecimal() else None
         if raw and self.owner is None:
             log("OWNER_ID must be numeric, ignoring it")
         self.pending = {}    # chat_id -> time when the bot stops waiting for a URL
@@ -539,6 +604,7 @@ class Panel:
             return
         cmd, arg = parse_cmd(text)
         if cmd.startswith("/"):
+            self.pending.pop(chat_id, None)  # any command ends a waiting Add URL
             handler = getattr(self, "cmd_" + cmd[1:], None)
             if handler:
                 handler(chat_id, arg)
@@ -556,6 +622,11 @@ class Panel:
         if action is None:
             url = url_for_label(text, self.store.snapshot()["urls"])
             if url is None:
+                if REMOVE_LABEL.match(text):
+                    # an old remove button: its number has moved or the URL is gone
+                    self.pending.pop(chat_id, None)
+                    self.show(chat_id, "remove", rich("{e:warn} Ye ab list me nahi hai. Naya list dekh lo."))
+                    return True
                 return False
             action = "rmu:" + url
         self.act(action, chat_id)
@@ -566,6 +637,8 @@ class Panel:
         name, _, arg = data.partition(":")
         store = self.store
         note, view = None, "main"
+        if name != "add":
+            self.pending.pop(chat_id, None)  # any other button ends a waiting Add URL
         if name == "ping":
             store.force.set()
             note = rich("{e:ping} Ping shuru ho gayi")
@@ -669,7 +742,7 @@ class Panel:
         self.show(chat_id, "main", rich("{e:fail} Ye number ya URL list me nahi mila."))
 
     def cmd_interval(self, chat_id, arg):
-        if not (arg.isdigit() and 1 <= int(arg) <= 60):
+        if not (arg.isdecimal() and 1 <= int(arg) <= 60):
             return self.tg.send(chat_id, rich("{e:warn} Interval 1 se 60 minute ke beech do. Jaise: /interval 5"))
         self.store.set_minutes(int(arg))
         self.show(chat_id, "main", rich("{e:clock} Interval ab {0} minute hai.", int(arg)))
@@ -694,30 +767,35 @@ class Panel:
 
 
 def poll_loop(panel):
-    try:
-        panel.tg.call("deleteWebhook")
-    except Exception as e:
-        log(f"deleteWebhook skipped: {type(e).__name__}")
-    offset = 0
+    webhook_cleared = False
+    offset = 0  # next update to ask for; moves past an update only after it is handled
     while True:
         try:
+            if not webhook_cleared:
+                panel.tg.call("deleteWebhook")
+                webhook_cleared = True
             updates = panel.tg.call("getUpdates", offset=offset, timeout=25,
                                     allowed_updates=["message"])
         except RetryAfter as e:
             time.sleep(e.seconds)
             continue
         except Exception as e:
-            log(f"telegram poll error: {e}")
+            log(f"telegram poll error: {type(e).__name__}")
             time.sleep(5)
             continue
-        for update in updates or []:
+        for update in updates if isinstance(updates, list) else []:
             try:
-                offset = update["update_id"] + 1
                 panel.handle(update)
             except RetryAfter as e:
+                # Telegram asked us to slow down: keep this update and the rest for the next
+                # getUpdates, after the wait. Nothing is lost.
                 time.sleep(e.seconds)
+                break
             except Exception as e:
-                log(f"telegram update error: {type(e).__name__}")
+                log(f"telegram update error: {type(e).__name__}")  # dropped, so no retry loop
+            uid = update.get("update_id") if isinstance(update, dict) else None
+            if isinstance(uid, int):
+                offset = max(offset, uid + 1)
 
 
 @app.route("/")
@@ -726,7 +804,19 @@ def health():
     return Response("ok", status=200, mimetype="text/plain")
 
 
+def web_port():
+    raw = os.environ.get("PORT", "").strip()
+    return int(raw) if raw.isdecimal() and 0 < int(raw) < 65536 else 10000
+
+
 def main():
+    # The web server starts first, so Render sees the port open before anything else runs.
+    port = web_port()
+    web = threading.Thread(target=app.run,
+                           kwargs={"host": "0.0.0.0", "port": port, "use_reloader": False},
+                           daemon=True)
+    web.start()
+    log(f"Serving on port {port}")
     store = Store(os.path.join(os.environ.get("DATA_DIR", "/tmp/pinger-data"), "state.json"))
     threading.Thread(target=ping_loop, args=(store,), daemon=True).start()
     token = os.environ.get("BOT_TOKEN", "").strip()
@@ -737,9 +827,7 @@ def main():
         threading.Thread(target=poll_loop, args=(panel,), daemon=True).start()
     else:
         log("BOT_TOKEN not set: web server only, no Telegram panel")
-    port = int(os.environ.get("PORT", "10000") or 10000)
-    log(f"Serving on port {port}")
-    app.run(host="0.0.0.0", port=port)
+    web.join()  # the process lives as long as the web server; if it stops, the process exits
 
 
 if __name__ == "__main__":
