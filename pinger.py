@@ -22,6 +22,7 @@ import requests
 from flask import Flask, Response
 
 MAX_URLS = 20
+MAX_USERS = 300  # cap on the allowed list and on the pending/denied list
 ADD_WINDOW = 120  # seconds the bot waits for a URL after "Add URL"
 ROUND_CAP = 45  # seconds: a ping round never waits longer than this for one URL
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
@@ -36,7 +37,7 @@ PREMIUM_EMOJI = {
     "pause": "", "play": "", "ping": "", "add": "", "remove": "", "list": "", "timer": "",
     "clock": "", "uptime": "", "link": "", "close": "", "back": "", "refresh": "",
     "globe": "", "star": "", "bolt": "", "shield": "", "chart": "", "crown": "",
-    "minus": "", "plus": "",
+    "minus": "", "plus": "", "unlock": "", "user": "", "request": "",
 }
 # Normal emoji: used when the ID above is empty, and what non-Premium users see.
 FALLBACK_EMOJI = {
@@ -44,7 +45,8 @@ FALLBACK_EMOJI = {
     "cancel": "🚫", "pause": "⏸", "play": "▶️", "ping": "⚡", "add": "➕", "remove": "🗑",
     "list": "📋", "timer": "⏱", "clock": "🕒", "uptime": "⏳", "link": "🔗", "close": "✖️",
     "back": "⬅️", "refresh": "🔄", "globe": "🌐", "star": "⭐", "bolt": "🔥", "shield": "🛡",
-    "chart": "📊", "crown": "👑", "minus": "➖", "plus": "➕",
+    "chart": "📊", "crown": "👑", "minus": "➖", "plus": "➕", "unlock": "🔓", "user": "👤",
+    "request": "🙋",
 }
 # Button colours supported by the Bot API: "success" green, "danger" red, "primary" blue.
 GO, STOP, INFO = "success", "danger", "primary"
@@ -186,7 +188,17 @@ FIXED_BUTTONS = [
     ("close", "Close", "close"),
     ("cancel", "Cancel", "cancel"),
     ("back", "Back", "home"),
+    ("lock", "Lock bot", "lock"),  # owner only
+    ("unlock", "Unlock bot", "unlock"),  # owner only
 ]
+# Actions only the owner may run (the owner gate for buttons).
+OWNER_ACTIONS = {"lock", "unlock"}
+# Non-owner buttons: "Request access" (shown to people who are not allowed yet).
+REQUEST_LABELS = {"Request access", f"{FALLBACK_EMOJI['request']} Request access"}
+# Owner buttons under an access request: "Allow 123" / "Deny 123".
+ACCESS_LABEL = re.compile(r"^(Allow|Deny) ([0-9]{1,15})$")
+# Owner-only slash commands.
+OWNER_CMDS = {"lock", "unlock", "allow", "deny", "users"}
 # Both spellings are accepted (with the normal emoji and without it), because a button can
 # lose its emoji when Telegram refuses a premium icon.
 LABEL_ACTION = {}
@@ -224,6 +236,34 @@ def valid_url(value):
         return bool(urlparse(value).netloc)
     except ValueError:  # malformed address such as an unclosed "[" in the host
         return False
+
+
+def valid_user_id(value):
+    return isinstance(value, int) and not isinstance(value, bool) and 0 < value < 10 ** 15
+
+
+def parse_user_id(text):
+    """A Telegram numeric ID from text, or None."""
+    text = text.strip()
+    if text.isdecimal() and 0 < int(text) < 10 ** 15:
+        return int(text)
+    return None
+
+
+def display_name(user):
+    """A short, printable name for the owner's request message. Never parsed as formatting."""
+    parts = [str(user.get("first_name") or ""), str(user.get("last_name") or "")]
+    name = " ".join(p for p in parts if p).strip()
+    if not name:
+        name = str(user.get("username") or "") or "no name"
+    return "".join(c for c in name if c.isprintable())[:40] or "no name"
+
+
+def ids_text(ids):
+    if not ids:
+        return "koi nahi"
+    shown = ", ".join(str(i) for i in ids[:20])
+    return shown + (f" (+{len(ids) - 20} aur)" if len(ids) > 20 else "")
 
 
 def short(text, limit=60):
@@ -319,8 +359,20 @@ class Store:
             last_at = None
         results = data.get("results") if isinstance(data.get("results"), dict) else {}
         summary = data.get("summary") if isinstance(data.get("summary"), str) else ""
+        # Locked unless the file says open: a new or old file starts private.
+        locked = data.get("locked") is not False
+        allowed = data.get("allowed")
+        allowed = [u for u in dict.fromkeys(allowed if isinstance(allowed, list) else [])
+                   if valid_user_id(u)][:MAX_USERS]
+        users = data.get("users")
+        users = users if isinstance(users, dict) else {}
+        users = {k: v for k, v in users.items()
+                 if isinstance(k, str) and k.isdecimal() and v in ("pending", "denied")
+                 and int(k) not in allowed}
+        users = dict(list(users.items())[:MAX_USERS])
         return {"urls": urls, "minutes": minutes, "paused": data.get("paused") is True,
-                "last_at": last_at, "summary": summary, "results": results}
+                "last_at": last_at, "summary": summary, "results": results,
+                "locked": locked, "allowed": allowed, "users": users}
 
     def write(self, data):
         """Atomic write: temp file first, flushed to disk, then renamed over the real file.
@@ -394,6 +446,55 @@ class Store:
         with self.lock:
             self.set_paused(not self.d["paused"])
             return self.d["paused"]
+
+    # ---- access: global lock plus per-user state ----
+    # d["allowed"] is the list of allowed Telegram IDs. d["users"] maps other IDs (as text)
+    # to "pending" (asked for access) or "denied". Rules:
+    #   locked: only allowed IDs (and the owner) can use the panel.
+    #   open:   anyone can use it unless denied.
+
+    def set_locked(self, value):
+        with self.lock:
+            self.d["locked"] = bool(value)
+            self.write(self.d)
+
+    def can_use(self, uid):
+        with self.lock:
+            if uid in self.d["allowed"]:
+                return True
+            if self.d["locked"]:
+                return False
+            return self.d["users"].get(str(uid)) != "denied"
+
+    def access_state(self, uid):
+        """"allowed", "pending", "denied" or "none"."""
+        with self.lock:
+            if uid in self.d["allowed"]:
+                return "allowed"
+            return self.d["users"].get(str(uid), "none")
+
+    def set_access(self, uid, state):
+        """state: "allowed", "pending" or "denied". Returns False when a list is full."""
+        with self.lock:
+            key = str(uid)
+            if state == "allowed":
+                if uid not in self.d["allowed"]:
+                    if len(self.d["allowed"]) >= MAX_USERS:
+                        return False
+                    self.d["allowed"].append(uid)
+                self.d["users"].pop(key, None)
+            else:
+                if uid in self.d["allowed"]:
+                    self.d["allowed"].remove(uid)
+                if key not in self.d["users"] and len(self.d["users"]) >= MAX_USERS:
+                    return False
+                self.d["users"][key] = state
+            self.write(self.d)
+            return True
+
+    def pending_ids(self):
+        with self.lock:
+            return sorted(int(k) for k, v in self.d["users"].items() if v == "pending")
 
     def is_due(self):
         with self.lock:
@@ -515,6 +616,8 @@ def card_text(snap):
     last_txt = dt.datetime.fromtimestamp(last, IST).strftime("%d %b, %H:%M IST") if last else "abhi tak nahi"
     state = "Paused" if snap["paused"] else "Running"
     status_emoji = "pause" if snap["paused"] else "play"
+    bot_state = "Locked" if snap["locked"] else "Open"
+    lock_emoji = "lock" if snap["locked"] else "unlock"
     return rich("\n".join([
         "{e:panel} **Keep-Alive Panel**",
         "━━━━━━━━━━━━━━━",
@@ -524,8 +627,9 @@ def card_text(snap):
         "{e:timer} Last ping: **{3}**",
         "{e:chart} Result: **{4}**",
         "{e:uptime} Uptime: **{5}**",
+        "{e:%s} Bot: **{6}**" % lock_emoji,
     ]), count, snap["minutes"], state, last_txt, snap["summary"] or "none yet",
-        fmt_uptime(snap["uptime"]))
+        fmt_uptime(snap["uptime"]), bot_state)
 
 
 def list_text(snap):
@@ -542,19 +646,29 @@ def list_text(snap):
     return rich("\n".join(lines), *raw)
 
 
-def main_kb(snap):
+def main_kb(snap, owner=False):
     if snap["paused"]:
         toggle = rbtn("play", "Resume", GO)
     else:
         toggle = rbtn("pause", "Pause", STOP)
-    return reply_kb([
+    rows = [
         [rbtn("ping", "Ping now", INFO), toggle],
         [rbtn("minus", "-1", INFO), rbtn("clock", f"{snap['minutes']} min", INFO),
          rbtn("plus", "+1", INFO)],
         [rbtn("list", "List URLs", INFO), rbtn("add", "Add URL", GO)],
         [rbtn("remove", "Remove", STOP), rbtn("refresh", "Refresh", INFO)],
-        [rbtn("close", "Close", STOP)],
-    ])
+    ]
+    if owner:  # the lock button is for the owner only
+        if snap["locked"]:
+            rows.append([rbtn("unlock", "Unlock bot", GO)])
+        else:
+            rows.append([rbtn("lock", "Lock bot", STOP)])
+    rows.append([rbtn("close", "Close", STOP)])
+    return reply_kb(rows)
+
+
+def request_kb():
+    return reply_kb([[rbtn("request", "Request access", INFO)]])
 
 
 def sub_kb(snap=None):
@@ -588,7 +702,9 @@ class Panel:
         raw_text, _ = message_text(msg)
         text = raw_text.strip()
         chat_id = msg["chat"]["id"]
-        user_id = (msg.get("from") or {}).get("id")
+        user = msg.get("from") or {}
+        user_id = user.get("id")
+        tap = msg.get("message_id")  # a button tap: removed once it is handled
         if self.owner is None:
             if parse_cmd(text)[0] == "/start":
                 self.tg.send(chat_id, rich(
@@ -596,26 +712,42 @@ class Panel:
                     "Render me OWNER_ID naam ki env variable me ye ID daal, "
                     "service restart karo, phir /start likho.", user_id))
             return
-        if user_id != self.owner:
-            if text:
-                self.tg.send(chat_id, rich("{e:lock} Ye bot private hai."))
+        if not isinstance(user_id, int):
             return
+        is_owner = user_id == self.owner
+        if not is_owner and not self.store.can_use(user_id):
+            # Locked, or denied: only the private line and the Request access button.
+            if not text:
+                return
+            if text in REQUEST_LABELS:
+                return self.request_access(chat_id, user, tap)
+            return self.gate(chat_id)
         if not text:
             return
         cmd, arg = parse_cmd(text)
         if cmd.startswith("/"):
             self.pending.pop(chat_id, None)  # any command ends a waiting Add URL
-            handler = getattr(self, "cmd_" + cmd[1:], None)
+            name = cmd[1:]
+            if name in OWNER_CMDS and not is_owner:
+                return self.show(chat_id, "main", rich("{e:warn} Ye command sirf owner ke liye hai."))
+            handler = getattr(self, "cmd_" + name, None)
             if handler:
                 handler(chat_id, arg)
             return
-        if self.on_label(chat_id, text):
+        if self.on_label(chat_id, text, is_owner, tap):
             return
         if chat_id in self.pending:
             self.take_url(chat_id, text)
 
-    def on_label(self, chat_id, text):
-        """Runs the action of a reply button the owner tapped. False when the text is no button."""
+    def on_label(self, chat_id, text, is_owner, tap=None):
+        """Runs the action of a reply button that was tapped. False when the text is no button."""
+        m = ACCESS_LABEL.match(text)
+        if m:
+            if not is_owner:
+                self.show(chat_id, "main", rich("{e:warn} Ye sirf owner ke liye hai."), tap)
+                return True
+            self.decide(chat_id, int(m.group(2)), m.group(1) == "Allow", tap)
+            return True
         action = LABEL_ACTION.get(text)
         if action is None and INTERVAL_LABEL.match(text):
             action = "noop"  # the interval button only shows the value
@@ -625,14 +757,18 @@ class Panel:
                 if REMOVE_LABEL.match(text):
                     # an old remove button: its number has moved or the URL is gone
                     self.pending.pop(chat_id, None)
-                    self.show(chat_id, "remove", rich("{e:warn} Ye ab list me nahi hai. Naya list dekh lo."))
+                    self.show(chat_id, "remove",
+                              rich("{e:warn} Ye ab list me nahi hai. Naya list dekh lo."), tap)
                     return True
                 return False
             action = "rmu:" + url
-        self.act(action, chat_id)
+        if action in OWNER_ACTIONS and not is_owner:
+            self.show(chat_id, "main", rich("{e:warn} Ye sirf owner ke liye hai."), tap)
+            return True
+        self.act(action, chat_id, tap)
         return True
 
-    def act(self, data, chat_id):
+    def act(self, data, chat_id, tap=None):
         """Runs one panel button, then sends the updated panel."""
         name, _, arg = data.partition(":")
         store = self.store
@@ -670,11 +806,18 @@ class Panel:
             view = "closed"
         elif name == "refresh":
             note = rich("{e:refresh} Updated")
-        self.show(chat_id, view, note)
+        elif name == "lock":
+            store.set_locked(True)
+            note = rich("{e:lock} Bot lock ho gaya. Ab sirf allowed users aur aap use kar sakte ho.")
+        elif name == "unlock":
+            store.set_locked(False)
+            note = rich("{e:unlock} Bot unlock ho gaya. Ab jo deny nahi hain wo use kar sakte hain.")
+        self.show(chat_id, view, note, tap)
 
-    def show(self, chat_id, view, note=None):
-        """Sends the panel for a view as one new message with its keyboard, then removes the old one."""
+    def show(self, chat_id, view, note=None, tap=None):
+        """Sends the panel for a view as one new message with its keyboard."""
         snap = self.store.snapshot()
+        is_owner = chat_id == self.owner
         if view == "list":
             msg, markup = list_text(snap), sub_kb()
         elif view == "remove":
@@ -691,14 +834,72 @@ class Panel:
             msg = rich("{e:close} Panel band hai. /start likho to phir khul jayega.")
             markup = {"remove_keyboard": True}
         else:
-            msg, markup = card_text(snap), main_kb(snap)
+            msg, markup = card_text(snap), main_kb(snap, is_owner)
         if note is not None:
             msg = join_rich(note, msg)
+        self.post(chat_id, msg, markup, tap)
+
+    def post(self, chat_id, msg, markup, tap=None):
+        """Sends one message as the new panel, then removes the old panel and the user's tap.
+        Removing is tidy-up only: a failed delete leaves the message in the chat."""
         sent = self.tg.send(chat_id, msg, markup)
         old = self.panel_mid.get(chat_id)
         self.panel_mid[chat_id] = (sent or {}).get("message_id")
         if old:
             self.tg.delete(chat_id, old)
+        if tap:
+            self.tg.delete(chat_id, tap)
+
+    def gate(self, chat_id, tap=None):
+        """A person who may not use the bot: short private line and the Request access button."""
+        self.post(chat_id, rich("{e:lock} Ye bot abhi private hai."), request_kb(), tap)
+
+    def request_access(self, chat_id, user, tap=None):
+        uid = user.get("id")
+        if self.store.access_state(uid) == "pending":
+            note = rich("{e:info} Aapki request pehle se bheji hui hai. Owner ke jawab ka wait karo.")
+        elif self.store.set_access(uid, "pending"):
+            note = rich("{e:ok} Request bhej di gayi hai.")
+            self.notify_owner_request(uid, display_name(user))
+        else:
+            note = rich("{e:warn} Abhi requests ki limit poori hai. Baad me try karo.")
+        self.post(chat_id, note, request_kb(), tap)
+
+    def notify_owner_request(self, uid, name):
+        markup = reply_kb([[rbtn(None, f"Allow {uid}", GO), rbtn(None, f"Deny {uid}", STOP)]])
+        msg = rich("{e:user} Access request\nNaam: {0}\nID: {1}\nAllow ya Deny dabao.",
+                   name, str(uid))
+        try:
+            self.tg.send(self.owner, msg, markup)
+        except Exception:
+            log("owner request not sent this time")  # still pending: /users lists it
+
+    def decide(self, chat_id, uid, allow, tap=None):
+        """Owner allows or denies one user ID. The user gets a one-line notice."""
+        if not valid_user_id(uid):
+            return self.show(chat_id, "main", rich("{e:warn} Ye ID sahi nahi hai."), tap)
+        if uid == self.owner:
+            return self.show(chat_id, "main",
+                             rich("{e:info} Owner ka access hamesha chalu rehta hai."), tap)
+        if not self.store.set_access(uid, "allowed" if allow else "denied"):
+            return self.show(chat_id, "main",
+                             rich("{e:warn} List poori bhari hai ({0}). Pehle kisi ko hata do.",
+                                  MAX_USERS), tap)
+        if allow:
+            note = rich("{e:ok} Allow kar diya: {0}", str(uid))
+            notice = rich("{e:ok} Aapko bot ka access mil gaya. /start likho.")
+        else:
+            note = rich("{e:cancel} Deny kar diya: {0}", str(uid))
+            notice = rich("{e:cancel} Aapki access request manzoor nahi hui.")
+        self.notify(uid, notice)
+        self.show(chat_id, "main", note, tap)
+
+    def notify(self, uid, msg):
+        """Fails silently: the user may never have started the bot."""
+        try:
+            self.tg.send(uid, msg)
+        except Exception:
+            pass
 
     def add_url(self, text):
         url = text.strip()
@@ -764,6 +965,35 @@ class Panel:
     def cmd_cancel(self, chat_id, arg):
         self.pending.pop(chat_id, None)
         self.show(chat_id, "main", rich("{e:cancel} Cancel ho gaya."))
+
+    # ---- owner-only commands ----
+
+    def cmd_lock(self, chat_id, arg):
+        self.store.set_locked(True)
+        self.show(chat_id, "main", rich("{e:lock} Bot lock ho gaya. Ab sirf allowed users aur aap use kar sakte ho."))
+
+    def cmd_unlock(self, chat_id, arg):
+        self.store.set_locked(False)
+        self.show(chat_id, "main", rich("{e:unlock} Bot unlock ho gaya. Ab jo deny nahi hain wo use kar sakte hain."))
+
+    def cmd_allow(self, chat_id, arg):
+        uid = parse_user_id(arg)
+        if uid is None:
+            return self.tg.send(chat_id, rich("{e:info} Aise likho: /allow 123456789"))
+        self.decide(chat_id, uid, True)
+
+    def cmd_deny(self, chat_id, arg):
+        uid = parse_user_id(arg)
+        if uid is None:
+            return self.tg.send(chat_id, rich("{e:info} Aise likho: /deny 123456789"))
+        self.decide(chat_id, uid, False)
+
+    def cmd_users(self, chat_id, arg):
+        snap = self.store.snapshot()
+        bot_state = "Locked" if snap["locked"] else "Open"
+        self.show(chat_id, "main", rich(
+            "{e:list} Bot: **{0}**\nAllowed: {1}\nPending: {2}",
+            bot_state, ids_text(snap["allowed"]), ids_text(self.store.pending_ids())))
 
 
 def poll_loop(panel):
