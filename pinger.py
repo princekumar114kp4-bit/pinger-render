@@ -25,6 +25,11 @@ MAX_URLS = 20
 MAX_USERS = 300  # cap on the allowed list and on the pending/denied list
 ADD_WINDOW = 120  # seconds the bot waits for a URL after "Add URL"
 ROUND_CAP = 45  # seconds: a ping round never waits longer than this for one URL
+TIMEOUT = (10, 20)  # seconds for one GET: connect, then read
+MAX_REDIRECTS = 3  # redirects followed for one GET, then it stops
+MAX_PARALLEL = 4  # most URLs pinged at the same time in one round
+MIN_ROUND_GAP = 60  # seconds: a new round (Ping now, resume, interval change) waits for this
+USER_AGENT = "KeepAlivePinger/1.0 (one simple GET per interval)"
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 API_BASE = os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/")
 
@@ -299,6 +304,20 @@ def own_url():
     return own if valid_url(own) else ""
 
 
+def fetch(url):
+    """One plain GET: a clear User-Agent, a timeout, at most MAX_REDIRECTS redirects,
+    no body download, no retry. Returns the status code as text."""
+    with requests.Session() as session:
+        session.max_redirects = MAX_REDIRECTS
+        # stream=True: only the status line is needed, the body is not downloaded
+        resp = session.get(url, timeout=TIMEOUT, stream=True,
+                           headers={"User-Agent": USER_AGENT})
+        try:
+            return str(resp.status_code)
+        finally:
+            resp.close()
+
+
 def ping_one(url):
     try:
         host = urlparse(url).hostname or "unknown-host"
@@ -306,10 +325,7 @@ def ping_one(url):
         host = "unknown-host"
     code = "down"
     try:
-        # stream=True: only the status line is needed, the body is not downloaded
-        resp = requests.get(url, timeout=20, stream=True)
-        code = str(resp.status_code)
-        resp.close()
+        code = fetch(url)
     except Exception:
         code = "down"  # error text is not logged: it can contain the full URL
     log(f"ping {code} {host}")  # host only, never the full URL
@@ -508,9 +524,10 @@ class Store:
             urls.append(own)
         codes = ["down"] * len(urls)
         if urls:
-            # All URLs run at once. A URL that hangs past the cap is counted as down,
-            # so one slow site cannot hold up the whole round.
-            pool = ThreadPoolExecutor(max_workers=len(urls))
+            # Each URL gets exactly one GET per round, at most MAX_PARALLEL at a time.
+            # A URL that hangs past the cap is counted as down, so one slow site
+            # cannot hold up the whole round.
+            pool = ThreadPoolExecutor(max_workers=min(len(urls), MAX_PARALLEL))
             futures = [pool.submit(ping_one, u) for u in urls]
             done, _ = wait(futures, timeout=ROUND_CAP)
             codes = [f.result() if f in done else "down" for f in futures]
@@ -524,11 +541,19 @@ class Store:
             self.write(self.d)
 
 
+def round_gap_passed(store):
+    """True when the last round ended long enough ago. Stops repeated taps or
+    interval changes from sending a new round to every URL again and again."""
+    with store.lock:
+        last = store.d.get("last_at") or 0
+    return time.time() - last >= MIN_ROUND_GAP
+
+
 def ping_loop(store):
     time.sleep(5)
     while True:
         try:
-            if store.force.is_set() or store.is_due():
+            if (store.force.is_set() or store.is_due()) and round_gap_passed(store):
                 store.force.clear()
                 store.run_round()
         except Exception as e:
